@@ -4,11 +4,15 @@ description: " Production-grade Go HTTP backend development using chi, PostgreSQ
 ---
 
 ## non-goals
-- This skill does not define frontend stack or infrastructure tooling
+
+- This skill does not define the frontend stack.
+- This skill does not define infrastructure provisioning (kubernetes, terraform, etc.).
+- This skill does not choose product requirements or UX.
 
 ## repository layout assumption
 
 All backend application code is rooted at:
+
 - `<repo_root>/backend`
 
 All paths defined in this skill that reference generated code, internal packages, or configuration are relative to `<repo_root>/backend` unless explicitly stated otherwise.
@@ -17,17 +21,18 @@ Schema files remain outside the backend module and MUST live at:
 - `<repo_root>/docs/schema/<version>/`
 
 ## operating rules
+
+- Dependencies MUST be injected explicitly; global state MUST NOT be introduced.
+- Startup MUST be deterministic and services MUST shut down gracefully.
+- Inputs MUST be validated and outputs MUST be well-defined and consistent.
 - New dependencies MUST NOT be introduced unless:
   1) The standard library cannot satisfy the requirement, and
   2) The dependency materially reduces implementation complexity.
   The justification MUST be stated in one sentence in the commit message.
-
-- The Go standard library MUST be preferred by default.
-  Third-party libraries MAY be used only when they provide functionality
-  that is non-trivial to implement correctly (e.g., cryptography, routing,
-  database drivers).
+- The Go standard library MUST be preferred by default. Third-party libraries MAY be used only when they provide functionality that is non-trivial to implement correctly.
 - Every change MUST compile and tests MUST pass.
 - Diffs SHOULD remain small; avoid “big bang” refactors.
+- If requirements are ambiguous, make a reasonable assumption and document it in code comments or a short note in the commit message.
 
 ## go style and correctness
 
@@ -35,7 +40,7 @@ Schema files remain outside the backend module and MUST live at:
   - Prefer short, clear names.
   - Prefer early returns and small, focused functions.
   - Prefer small interfaces defined at the call site.
-  - Errors MUST be wrapped using %w (or an equivalent mechanism preserving errors.Is/As semantics).
+  - Errors MUST be explicit and wrapped with `%w` when adding context (or an equivalent mechanism preserving errors.Is/As semantics).
 
 - Errors:
   - Prefer sentinel errors declared with `var ErrX = errors.New("...")` for stable comparisons.
@@ -53,7 +58,7 @@ Schema files remain outside the backend module and MUST live at:
   - Avoid deeply-nested `if err != nil` ladders; return early.
 
 - Struct initialization:
-  - Avoid partially-initialized structs.
+  - Avoid partially-initialized structs when a type has invariants.
   - Prefer constructors (e.g., `NewX(...)`) when a type has invariants.
   - If a struct has required fields, enforce them at construction time.
 
@@ -73,6 +78,36 @@ Schema files remain outside the backend module and MUST live at:
   - Secrets MUST NOT be logged.
   - Log at boundaries (HTTP entry/exit, DB errors, external calls) rather than in tight loops.
 
+## tooling and external binaries
+
+To avoid environment drift, all external tooling (linters, generators, dev reloaders, migration CLIs) MUST be installed into the repository-local tools directory and invoked via Make targets.
+
+- Tool installation location:
+  - All Go-based tools MUST be installed with `GOBIN` set to:
+    - `<repo_root>/backend/tools/bin` (repo-local)
+  - Tools MUST NOT be installed into a user/global path (e.g., `/usr/local/bin`, `~/go/bin`, Homebrew, etc.) for project workflows.
+
+- Required Makefile pattern:
+  - The backend Makefile MUST define:
+    - `TOOLS_DIR := tools`
+    - `TOOLS_BIN := $(abspath $(TOOLS_DIR)/bin)`
+    - `tools-dir` target to create `$(TOOLS_BIN)`
+    - `tools-install` target to install all required tools into `$(TOOLS_BIN)`
+    - per-tool targets that run `GOBIN=$(TOOLS_BIN) go install ...@<version>`
+  - Tool versions MUST be pinned (explicit versions) unless explicitly justified (e.g., `latest` for a formatting tool).
+
+- Invocation rules:
+  - Project workflows MUST invoke tools via `$(TOOLS_BIN)/<tool>` (typically through Make targets).
+  - Scripts and documentation MUST NOT assume tools are on `PATH`.
+  - `go tool` MUST NOT be used for managing third-party tooling.
+
+- Minimum required tools (when applicable):
+  - `air` (dev reload)
+  - `gofumpt` (formatting)
+  - `golangci-lint` (linting)
+  - `migrate` (migrations; `github.com/golang-migrate/migrate`)
+  - `oapi-codegen` (OpenAPI codegen)
+
 ## project structure
 
 Packages MUST be cohesive and named by responsibility. Prefer feature-oriented packages with explicit dependency inversion (interfaces owned by the feature package, implementations owned by infrastructure packages).
@@ -81,7 +116,6 @@ Packages MUST be cohesive and named by responsibility. Prefer feature-oriented p
   - All paths below are relative to `<repo_root>/backend`.
 
 - Recommended layout (feature-oriented):
-
   - cmd/<app>/main.go
     - Composition root; wiring only.
 
@@ -143,6 +177,7 @@ The following modules are part of the standard backend stack and MUST be used wh
 
 These modules are considered part of the baseline architecture and do NOT require dependency justification under the operating rules above.
 
+
 ## HTTP API contract
 
 The HTTP API MUST be defined schema-first in an OpenAPI specification (OpenAPI 3.0 or 3.1).
@@ -169,26 +204,48 @@ The HTTP API MUST be defined schema-first in an OpenAPI specification (OpenAPI 3
       - `package` MUST match the target Go package name.
       - `output` MUST be backend-relative (e.g. `internal/api/v1/api.gen.go`) and MUST be committed to the repository
   - Generation MUST NOT rely on implicit defaults.
+- Generated code location (backend-relative):
+  - Generated server/client/types code MUST be written to:
+    - `internal/api/<version>/api.gen.go`
+  - The generated file MUST be committed and MUST NOT be manually edited.
+
+- Path/version consistency:
+  - `<version>` MUST be of the form `vN` (e.g., `v1`, `v2`).
+  - `<version>` MUST match:
+    - the route prefix (e.g., `/v1/...`), and
+    - the OpenAPI `info.version` major version.
+
 - The OpenAPI spec MUST be the single source of truth for:
   - paths/routes
   - request/response shapes
   - error responses
   - auth schemes (if any)
+
 - Hand-written route definitions MUST NOT introduce endpoints that are not present in the OpenAPI spec.
+
 - Versioning:
   - The API version MUST start at `v1`.
   - The version MUST be reflected in the HTTP surface (e.g., `/v1/...`) and in the OpenAPI `info.version`.
   - The version MUST NOT be bumped unless explicitly requested by the user OR the change is a breaking change.
   - If a breaking change is required without a version bump, the change MUST be rejected and alternatives proposed.
+
+- Code generation:
+  - `oapi-codegen` MUST be used for server (and/or client) boilerplate.
+  - Generated code MUST be committed (no generation at runtime).
+  - Manual edits to generated files MUST NOT be made; extend via wrappers/handlers instead.
+
 - Validation & compatibility:
   - All incoming requests MUST be validated against the generated types and/or OpenAPI schema.
   - Responses MUST conform to the OpenAPI schema (status codes + body shapes).
   - Backwards-compatible additive changes (new optional fields, new endpoints) SHOULD be preferred over breaking changes.
+
 - Error model:
-  - The API SHOULD define a consistent error envelope (e.g., `{code, message, details}`) and reuse it across endpoints.
+  - The API MUST define a consistent error envelope (e.g., `{code, message, details}`) and reuse it across endpoints.
   - Validation errors SHOULD be deterministic and include field-level details where appropriate.
+
 - Generation MUST be reproducible via a single repo-root command (e.g., `make generate`).
 - CI MUST fail if generated code is out of date.
+
 
 ## backend configuration
 
@@ -249,7 +306,7 @@ This section defines the required persistence stack and its filesystem layout. A
   - ORMs (gorm, ent, sqlboiler, etc.)
   - Runtime auto-migrations
   - Any migration framework other than `github.com/golang-migrate/migrate`
-  - Raw SQL strings in Go code outside sqlc-managed `.sql` files (except for very small, one-off operational queries that MUST be documented)
+  - Raw SQL strings in Go code outside sqlc-managed `.sql` files
 
 - Filesystem layout:
   - DB infrastructure code MUST live under `internal/db/`
@@ -274,7 +331,6 @@ This section defines the required persistence stack and its filesystem layout. A
   - The application binary MUST NOT automatically execute migrations at startup.
   - CI MUST fail if pending migrations exist or migration application fails.
   - Down migrations MUST be maintained for each up migration unless explicitly documented as non-reversible.
-
 
 ## testing expectations
 
